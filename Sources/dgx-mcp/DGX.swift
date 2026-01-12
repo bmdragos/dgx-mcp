@@ -134,6 +134,40 @@ enum DGX {
             description: "Stop the embedding server gracefully",
             inputSchema: ["type": "object", "properties": [:] as [String: Any], "required": [] as [String]]
         ),
+        // MARK: - Generic Service Tools
+        MCP.Tool(
+            name: "dgx_service_status",
+            description: "Check service status. Lists all services if no service specified, or details for a specific service.",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference'). Lists all if omitted."]
+                ] as [String: Any],
+                "required": [] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_service_start",
+            description: "Start a service defined in config.json",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference')"]
+                ] as [String: Any],
+                "required": ["service"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_service_stop",
+            description: "Stop a running service",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference')"]
+                ] as [String: Any],
+                "required": ["service"] as [String]
+            ]
+        ),
         MCP.Tool(
             name: "dgx_telemetry",
             description: "Get real-time telemetry from DGXDash app. Returns GPU util, memory, temp, container stats, trends, and alerts. Use this to monitor resource usage during long-running computations.",
@@ -347,6 +381,77 @@ enum DGX {
                 ] as [String: Any],
                 "required": [] as [String]
             ]
+        ),
+        // MARK: - Config Management Tools
+        MCP.Tool(
+            name: "dgx_config_add_service",
+            description: "Add a new service to config.json for dgx_service_* commands",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Service name (e.g., 'onnx-inference')"],
+                    "container": ["type": "string", "description": "Container name to run the service in"],
+                    "process": ["type": "string", "description": "Process pattern for pgrep detection (e.g., 'uvicorn', 'python.*server')"],
+                    "start_cmd": ["type": "string", "description": "Command to start the service (e.g., 'cd /workspace && python server.py --port 8081')"],
+                    "port": ["type": "integer", "description": "Port the service listens on"],
+                    "health": ["type": "string", "description": "Health endpoint path (e.g., '/health'). Optional."],
+                    "description": ["type": "string", "description": "Human-readable description. Optional."]
+                ] as [String: Any],
+                "required": ["name", "container", "process", "start_cmd", "port"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_config_add_project",
+            description: "Add a new project to config.json for dgx_sync commands",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Project name (e.g., 'my-project')"],
+                    "local": ["type": "string", "description": "Local path to project (e.g., '/Users/bd/Coding/my-project')"],
+                    "container": ["type": "string", "description": "Container name for the project"],
+                    "remote": ["type": "string", "description": "Remote path in container (e.g., '/workspace/my-project')"],
+                    "exclude": ["type": "array", "items": ["type": "string"], "description": "Patterns to exclude from sync (e.g., ['.git', '__pycache__', '.venv'])"]
+                ] as [String: Any],
+                "required": ["name", "local", "container", "remote"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_config_add_container",
+            description: "Add a new container to config.json",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Container name (e.g., 'my-container')"],
+                    "host": ["type": "string", "description": "Host name from hosts config (default: 'spark')"],
+                    "image": ["type": "string", "description": "Docker image (e.g., 'nvcr.io/nvidia/pytorch:25.01-py3')"],
+                    "workdir": ["type": "string", "description": "Default working directory (e.g., '/workspace')"]
+                ] as [String: Any],
+                "required": ["name", "image", "workdir"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_container_create",
+            description: "Create a Docker container on DGX with correct volume mounts for associated projects. Creates host directories, then runs docker with per-project mounts mapping ~/{project} to {remote} in container.",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "container": ["type": "string", "description": "Container name from config"],
+                    "ports": ["type": "array", "items": ["type": "string"], "description": "Port mappings (e.g., ['8081:8081'])"]
+                ] as [String: Any],
+                "required": ["container"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_install",
+            description: "Install apt packages in a container. Runs apt-get update && apt-get install.",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "packages": ["type": "array", "items": ["type": "string"], "description": "Package names to install (e.g., ['ffmpeg', 'vim'])"],
+                    "container": ["type": "string", "description": "Container name (default: from config)"]
+                ] as [String: Any],
+                "required": ["packages"] as [String]
+            ]
         )
     ]
 
@@ -361,10 +466,18 @@ enum DGX {
         case "dgx_logs":        return try await logs(container: args["container"] as? String, lines: args["lines"] as? Int)
         case "dgx_start":       return try await start(container: args["container"] as? String)
         case "dgx_stop":        return try await stop(container: args["container"] as? String)
-        // Embedding server
-        case "dgx_embed_status": return try await embedStatus()
-        case "dgx_embed_start":  return try await embedStart()
-        case "dgx_embed_stop":   return try await embedStop()
+        // Embedding server (aliases for backward compatibility)
+        case "dgx_embed_status": return try await serviceStatus(service: "embedding")
+        case "dgx_embed_start":  return try await serviceStart(service: "embedding")
+        case "dgx_embed_stop":   return try await serviceStop(service: "embedding")
+        // Generic service management
+        case "dgx_service_status": return try await serviceStatus(service: args["service"] as? String)
+        case "dgx_service_start":
+            guard let svc = args["service"] as? String else { throw MCPError.unknownTool("dgx_service_start requires service") }
+            return try await serviceStart(service: svc)
+        case "dgx_service_stop":
+            guard let svc = args["service"] as? String else { throw MCPError.unknownTool("dgx_service_stop requires service") }
+            return try await serviceStop(service: svc)
         case "dgx_exec":
             guard let cmd = args["command"] as? String else { throw MCPError.unknownTool("dgx_exec requires command") }
             return try await exec(command: cmd, container: args["container"] as? String)
@@ -423,6 +536,45 @@ enum DGX {
             return try await queueClear(container: args["container"] as? String)
         case "dgx_queue_start":
             return try await queueStart(container: args["container"] as? String)
+        // Config management
+        case "dgx_config_add_service":
+            guard let name = args["name"] as? String,
+                  let container = args["container"] as? String,
+                  let process = args["process"] as? String,
+                  let startCmd = args["start_cmd"] as? String,
+                  let port = args["port"] as? Int else {
+                throw MCPError.unknownTool("dgx_config_add_service requires name, container, process, start_cmd, port")
+            }
+            return try configAddService(name: name, container: container, process: process, startCmd: startCmd, port: port,
+                                         health: args["health"] as? String, description: args["description"] as? String)
+        case "dgx_config_add_project":
+            guard let name = args["name"] as? String,
+                  let local = args["local"] as? String,
+                  let container = args["container"] as? String,
+                  let remote = args["remote"] as? String else {
+                throw MCPError.unknownTool("dgx_config_add_project requires name, local, container, remote")
+            }
+            let exclude = args["exclude"] as? [String] ?? [".git", "__pycache__", ".DS_Store"]
+            return try configAddProject(name: name, local: local, container: container, remote: remote, exclude: exclude)
+        case "dgx_config_add_container":
+            guard let name = args["name"] as? String,
+                  let image = args["image"] as? String,
+                  let workdir = args["workdir"] as? String else {
+                throw MCPError.unknownTool("dgx_config_add_container requires name, image, workdir")
+            }
+            let host = args["host"] as? String ?? "spark"
+            return try configAddContainer(name: name, host: host, image: image, workdir: workdir)
+        case "dgx_container_create":
+            guard let container = args["container"] as? String else {
+                throw MCPError.unknownTool("dgx_container_create requires container")
+            }
+            let ports = args["ports"] as? [String] ?? []
+            return try await containerCreate(container: container, ports: ports)
+        case "dgx_install":
+            guard let packages = args["packages"] as? [String], !packages.isEmpty else {
+                throw MCPError.unknownTool("dgx_install requires packages array")
+            }
+            return try await install(packages: packages, container: args["container"] as? String)
         default:
             throw MCPError.unknownTool(name)
         }
@@ -431,9 +583,22 @@ enum DGX {
     // MARK: - Config
 
     struct Config: Codable {
-        let hosts: [String: Host]
-        let containers: [String: Container]
-        let projects: [String: Project]
+        var hosts: [String: Host]
+        var containers: [String: Container]
+        var projects: [String: Project]
+        var services: [String: Service]?
+
+        struct Service: Codable {
+            var container: String
+            var process: String
+            var startCmd: String
+            var port: Int
+            var health: String?
+            var description: String?
+            enum CodingKeys: String, CodingKey {
+                case container, process, startCmd = "start_cmd", port, health, description
+            }
+        }
 
         struct Host: Codable {
             let hostname: String?
@@ -444,16 +609,17 @@ enum DGX {
         }
 
         struct Container: Codable {
-            let host: String
-            let image: String
-            let workdir: String
+            var host: String
+            var image: String
+            var workdir: String
         }
 
         struct Project: Codable {
-            let local: String
-            let container: String
-            let remote: String
-            let exclude: [String]
+            var local: String
+            var container: String
+            var remote: String
+            var exclude: [String]
+            var results: String?  // Optional: subdirectory to pull (e.g., "output"). If nil, pulls whole project.
         }
     }
 
@@ -492,6 +658,242 @@ enum DGX {
     private static func loadConfig() throws -> Config {
         let data = try Data(contentsOf: configPath)
         return try JSONDecoder().decode(Config.self, from: data)
+    }
+
+    private static func saveConfig(_ config: Config) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(config).write(to: configPath)
+    }
+
+    // MARK: - Config Management
+
+    private static func configAddService(name: String, container: String, process: String, startCmd: String, port: Int, health: String?, description: String?) throws -> String {
+        var config = try loadConfig()
+
+        // Check if service already exists
+        if config.services?[name] != nil {
+            return "❌ Service '\(name)' already exists. Remove it first or use a different name."
+        }
+
+        let service = Config.Service(container: container, process: process, startCmd: startCmd, port: port, health: health, description: description)
+
+        if config.services == nil {
+            config.services = [:]
+        }
+        config.services?[name] = service
+
+        try saveConfig(config)
+
+        var lines = ["✓ Added service '\(name)'"]
+        lines.append("")
+        lines.append("**Container:** \(container)")
+        lines.append("**Process:** \(process)")
+        lines.append("**Port:** \(port)")
+        if let h = health { lines.append("**Health:** \(h)") }
+        if let d = description { lines.append("**Description:** \(d)") }
+        lines.append("")
+        lines.append("Use `dgx_service_start service:\(name)` to start")
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func configAddProject(name: String, local: String, container: String, remote: String, exclude: [String]) throws -> String {
+        var config = try loadConfig()
+
+        // Check if project already exists
+        if config.projects[name] != nil {
+            return "❌ Project '\(name)' already exists. Remove it first or use a different name."
+        }
+
+        // Verify container exists
+        if config.containers[container] == nil {
+            return "❌ Container '\(container)' not found in config. Add it first with dgx_config_add_container."
+        }
+
+        let project = Config.Project(local: local, container: container, remote: remote, exclude: exclude)
+        config.projects[name] = project
+
+        try saveConfig(config)
+
+        var lines = ["✓ Added project '\(name)'"]
+        lines.append("")
+        lines.append("**Local:** \(local)")
+        lines.append("**Container:** \(container)")
+        lines.append("**Remote:** \(remote)")
+        lines.append("**Exclude:** \(exclude.joined(separator: ", "))")
+        lines.append("")
+        lines.append("Use `dgx_sync direction:push project:\(name)` to sync")
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func configAddContainer(name: String, host: String, image: String, workdir: String) throws -> String {
+        var config = try loadConfig()
+
+        // Check if container already exists
+        if config.containers[name] != nil {
+            return "❌ Container '\(name)' already exists. Remove it first or use a different name."
+        }
+
+        // Verify host exists
+        if config.hosts[host] == nil {
+            return "❌ Host '\(host)' not found in config."
+        }
+
+        let container = Config.Container(host: host, image: image, workdir: workdir)
+        config.containers[name] = container
+
+        try saveConfig(config)
+
+        var lines = ["✓ Added container '\(name)'"]
+        lines.append("")
+        lines.append("**Host:** \(host)")
+        lines.append("**Image:** \(image)")
+        lines.append("**Workdir:** \(workdir)")
+        lines.append("")
+        lines.append("Next: Use `dgx_container_create container:\(name)` to create the container on DGX")
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func containerCreate(container containerName: String, ports: [String]) async throws -> String {
+        let config = try loadConfig()
+
+        // Verify container is in config
+        guard let containerConfig = config.containers[containerName] else {
+            let available = config.containers.keys.joined(separator: ", ")
+            return "❌ Container '\(containerName)' not found in config. Available: \(available)"
+        }
+
+        // Check if container already exists on host
+        let (existing, _) = try await ssh("docker inspect \(containerName) --format '{{.State.Status}}' 2>/dev/null || echo 'not_found'")
+        if existing.trimmingCharacters(in: .whitespacesAndNewlines) != "not_found" {
+            return "❌ Container '\(containerName)' already exists on DGX (status: \(existing.trimmingCharacters(in: .whitespacesAndNewlines))). Remove it first with: docker rm -f \(containerName)"
+        }
+
+        // Get host user for home directory
+        guard let hostConfig = config.hosts[containerConfig.host] else {
+            return "❌ Host '\(containerConfig.host)' not found in config."
+        }
+        let user = hostConfig.user
+
+        // Find all projects associated with this container
+        var mounts: [(host: String, container: String)] = []
+        var projectNames: [String] = []
+        for (projectName, project) in config.projects where project.container == containerName {
+            // Host path: ~/{project_name} (rsync convention)
+            let hostPath = "/home/\(user)/\(projectName)"
+            // Container path: from project config (e.g., /workspace/demucs)
+            let containerPath = project.remote
+            mounts.append((hostPath, containerPath))
+            projectNames.append(projectName)
+        }
+
+        var lines: [String] = []
+        lines.append("Creating container '\(containerName)'...")
+        lines.append("")
+
+        // Create host directories
+        if !mounts.isEmpty {
+            lines.append("**1. Creating host directories:**")
+            for mount in mounts {
+                let (_, code) = try await ssh("mkdir -p \(mount.host)")
+                if code == 0 {
+                    lines.append("   ✓ \(mount.host)")
+                } else {
+                    lines.append("   ❌ Failed to create \(mount.host)")
+                }
+            }
+            lines.append("")
+        }
+
+        // Build docker run command
+        var dockerCmd = "docker run -d --name \(containerName) --runtime=nvidia --gpus all"
+
+        // Add volume mounts
+        for mount in mounts {
+            dockerCmd += " -v \(mount.host):\(mount.container)"
+        }
+
+        // Add port mappings
+        for port in ports {
+            dockerCmd += " -p \(port)"
+        }
+
+        // Add standard GPU container flags
+        dockerCmd += " --ipc=host --ulimit memlock=-1 --ulimit stack=67108864"
+
+        // Set workdir and image
+        dockerCmd += " -w \(containerConfig.workdir) \(containerConfig.image) tail -f /dev/null"
+
+        lines.append("**2. Running docker:**")
+        lines.append("```")
+        lines.append(dockerCmd)
+        lines.append("```")
+        lines.append("")
+
+        let (result, code) = try await ssh(dockerCmd)
+        if code == 0 {
+            lines.append("✓ Container created successfully")
+            lines.append("")
+            lines.append("**Volume mounts:**")
+            for (i, mount) in mounts.enumerated() {
+                lines.append("  \(projectNames[i]): \(mount.host) → \(mount.container)")
+            }
+            lines.append("")
+            lines.append("rsync syncs to ~/{project_name} on host, which maps to {remote} in container.")
+        } else {
+            lines.append("❌ Failed to create container:")
+            lines.append(result)
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func install(packages: [String], container containerName: String?) async throws -> String {
+        let config = try loadConfig()
+
+        // Resolve container name
+        let resolvedContainer: String
+        if let containerName = containerName {
+            resolvedContainer = containerName
+        } else if let firstContainer = config.containers.keys.first {
+            resolvedContainer = firstContainer
+        } else {
+            return "❌ No container specified and none found in config."
+        }
+
+        // Verify container exists in config
+        guard config.containers[resolvedContainer] != nil else {
+            let available = config.containers.keys.joined(separator: ", ")
+            return "❌ Container '\(resolvedContainer)' not found. Available: \(available)"
+        }
+
+        let packageList = packages.joined(separator: " ")
+        var lines: [String] = []
+        lines.append("Installing packages in '\(resolvedContainer)': \(packageList)")
+        lines.append("")
+
+        // Run apt-get update
+        lines.append("Updating package lists...")
+        let (_, updateCode) = try await ssh("docker exec \(resolvedContainer) apt-get update -qq")
+        if updateCode != 0 {
+            lines.append("⚠️ apt-get update had warnings (continuing anyway)")
+        }
+
+        // Install packages
+        lines.append("Installing: \(packageList)")
+        let (result, code) = try await ssh("docker exec \(resolvedContainer) apt-get install -y -qq \(packageList)")
+
+        if code == 0 {
+            lines.append("✓ Packages installed successfully")
+        } else {
+            lines.append("❌ Installation failed:")
+            lines.append(result)
+        }
+
+        return lines.joined(separator: "\n")
     }
 
     private static func loadState() -> State {
@@ -974,152 +1376,170 @@ enum DGX {
         return ok == 0 ? "Container \(name) stopped" : "Failed to stop \(name)"
     }
 
-    // MARK: - Embedding Server
+    // MARK: - Service Management
 
-    private static let embedContainer = "embedding-server"
-    private static let embedEndpoint = "http://192.168.1.159:8080"
+    private static func getServiceEndpoint(config: Config, service: Config.Service) -> String {
+        // Get host IP from first host (assumes single-host setup)
+        let hostIP = config.hosts.values.first?.fallbackIP ?? "192.168.1.159"
+        return "http://\(hostIP):\(service.port)"
+    }
 
-    private static func embedStatus() async throws -> String {
+    private static func serviceStatus(service serviceName: String?) async throws -> String {
+        let config = try loadConfig()
+        guard let services = config.services, !services.isEmpty else {
+            return "No services configured.\n\nAdd services to ~/.dgx/config.json under \"services\" key."
+        }
+
+        // If no service specified, list all
+        if serviceName == nil {
+            var lines: [String] = ["## Services"]
+            lines.append("")
+            for (name, svc) in services.sorted(by: { $0.key < $1.key }) {
+                let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
+                let running = !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let status = running ? "🟢" : "🔴"
+                let desc = svc.description ?? svc.container
+                lines.append("\(status) **\(name)**: \(desc)")
+            }
+            lines.append("")
+            lines.append("Use `dgx_service_status service:<name>` for details")
+            return lines.joined(separator: "\n")
+        }
+
+        // Specific service status
+        guard let svc = services[serviceName!] else {
+            let available = services.keys.sorted().joined(separator: ", ")
+            return "❌ Unknown service: \(serviceName!)\n\nAvailable: \(available)"
+        }
+
+        let endpoint = getServiceEndpoint(config: config, service: svc)
         var lines: [String] = []
 
         // Check if container is running
-        let (containerOut, _) = try await ssh("docker ps --filter name=\(embedContainer) --format '{{.Status}}'")
+        let (containerOut, _) = try await ssh("docker ps --filter name=\(svc.container) --format '{{.Status}}'")
         let containerRunning = !containerOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         if !containerRunning {
-            lines.append("## Embedding Server Status")
+            lines.append("## \(serviceName!) Status")
             lines.append("")
             lines.append("**Status:** 🔴 Container stopped")
-            lines.append("**Container:** \(embedContainer)")
+            lines.append("**Container:** \(svc.container)")
             lines.append("")
-            lines.append("Run `dgx_embed_start` to start the server")
+            lines.append("Run `dgx_service_start service:\(serviceName!)` to start")
             return lines.joined(separator: "\n")
         }
 
-        // Check if uvicorn is running
-        let (procOut, _) = try await ssh("docker exec \(embedContainer) pgrep -f uvicorn 2>/dev/null || echo ''")
-        let uvicornRunning = !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Check if process is running
+        let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
+        let processRunning = !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-        if !uvicornRunning {
-            lines.append("## Embedding Server Status")
+        if !processRunning {
+            lines.append("## \(serviceName!) Status")
             lines.append("")
-            lines.append("**Status:** 🟡 Container running, server stopped")
-            lines.append("**Container:** \(embedContainer)")
+            lines.append("**Status:** 🟡 Container running, service stopped")
+            lines.append("**Container:** \(svc.container)")
             lines.append("")
-            lines.append("Run `dgx_embed_start` to start the server")
+            lines.append("Run `dgx_service_start service:\(serviceName!)` to start")
             return lines.joined(separator: "\n")
         }
 
-        // Try to get health info from the server
-        let (healthOut, healthOk) = try await ssh("curl -s \(embedEndpoint)/health 2>/dev/null || echo '{}'")
-        let (statsOut, _) = try await ssh("curl -s \(embedEndpoint)/stats 2>/dev/null || echo '{}'")
-        let (jobsOut, _) = try await ssh("curl -s \(embedEndpoint)/jobs 2>/dev/null || echo '{}'")
+        // Try health endpoint if configured
+        if let healthPath = svc.health {
+            let (healthOut, healthOk) = try await ssh("curl -s \(endpoint)\(healthPath) 2>/dev/null || echo '{}'")
 
-        lines.append("## Embedding Server Status")
-        lines.append("")
+            lines.append("## \(serviceName!) Status")
+            lines.append("")
 
-        if healthOk == 0, let healthData = try? JSONSerialization.jsonObject(with: Data(healthOut.utf8)) as? [String: Any],
-           let model = healthData["model"] as? String {
-            lines.append("**Status:** 🟢 Running")
-            lines.append("**Model:** \(model)")
-            if let version = healthData["version"] as? String {
-                lines.append("**Version:** \(version)")
-            }
-            if let dims = healthData["dimensions"] as? Int {
-                lines.append("**Dimensions:** \(dims)")
-            }
-            if let memMB = healthData["gpu_memory_allocated_mb"] as? Double {
-                lines.append("**GPU Memory:** \(String(format: "%.1f", memMB / 1000)) GB")
+            if healthOk == 0, let healthData = try? JSONSerialization.jsonObject(with: Data(healthOut.utf8)) as? [String: Any] {
+                lines.append("**Status:** 🟢 Running")
+                // Show any useful health data
+                for (key, value) in healthData.sorted(by: { $0.key < $1.key }) {
+                    if key == "gpu_memory_allocated_mb", let mb = value as? Double {
+                        lines.append("**GPU Memory:** \(String(format: "%.1f", mb / 1000)) GB")
+                    } else if let strVal = value as? String {
+                        lines.append("**\(key.capitalized):** \(strVal)")
+                    } else if let intVal = value as? Int {
+                        lines.append("**\(key.capitalized):** \(intVal)")
+                    }
+                }
+            } else {
+                lines.append("**Status:** 🟡 Starting...")
             }
         } else {
-            lines.append("**Status:** 🟡 Starting (model loading...)")
-            lines.append("**Note:** Server takes ~90s to load model and warm up")
-        }
-
-        // Stats
-        if let statsData = try? JSONSerialization.jsonObject(with: Data(statsOut.utf8)) as? [String: Any] {
+            lines.append("## \(serviceName!) Status")
             lines.append("")
-            lines.append("### Stats")
-            if let requests = statsData["requests"] as? Int {
-                lines.append("- Requests: \(requests)")
-            }
-            if let embedded = statsData["texts_embedded"] as? Int {
-                lines.append("- Texts embedded: \(embedded)")
-            }
-            if let uptime = statsData["uptime_seconds"] as? Double {
-                let hours = Int(uptime) / 3600
-                let mins = (Int(uptime) % 3600) / 60
-                lines.append("- Uptime: \(hours)h \(mins)m")
-            }
+            lines.append("**Status:** 🟢 Running")
         }
 
-        // Active jobs
-        if let jobsData = try? JSONSerialization.jsonObject(with: Data(jobsOut.utf8)) as? [String: Any],
-           let activeJobs = jobsData["active"] as? [[String: Any]], !activeJobs.isEmpty {
-            lines.append("")
-            lines.append("### Active Jobs")
-            for job in activeJobs {
-                if let project = job["project"] as? String,
-                   let percent = job["percent"] as? Int {
-                    lines.append("- \(project): \(percent)%")
-                }
-            }
+        if let desc = svc.description {
+            lines.append("**Description:** \(desc)")
         }
-
-        lines.append("")
-        lines.append("**Endpoint:** \(embedEndpoint)")
-        lines.append("**Dashboard:** \(embedEndpoint)/")
+        lines.append("**Container:** \(svc.container)")
+        lines.append("**Endpoint:** \(endpoint)")
 
         return lines.joined(separator: "\n")
     }
 
-    private static func embedStart() async throws -> String {
+    private static func serviceStart(service serviceName: String) async throws -> String {
+        let config = try loadConfig()
+        guard let services = config.services, let svc = services[serviceName] else {
+            let available = config.services?.keys.sorted().joined(separator: ", ") ?? "none"
+            return "❌ Unknown service: \(serviceName)\n\nAvailable: \(available)"
+        }
+
+        let endpoint = getServiceEndpoint(config: config, service: svc)
         var lines: [String] = []
 
         // Ensure container is running
-        let (containerOut, _) = try await ssh("docker ps --filter name=\(embedContainer) --format '{{.Status}}'")
+        let (containerOut, _) = try await ssh("docker ps --filter name=\(svc.container) --format '{{.Status}}'")
         if containerOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Container not running, start it
-            let (_, startOk) = try await ssh("docker start \(embedContainer)")
+            let (_, startOk) = try await ssh("docker start \(svc.container)")
             if startOk != 0 {
-                return "❌ Failed to start container \(embedContainer)"
+                return "❌ Failed to start container \(svc.container)"
             }
-            lines.append("✓ Started container \(embedContainer)")
+            lines.append("✓ Started container \(svc.container)")
         }
 
-        // Check if uvicorn already running
-        let (procOut, _) = try await ssh("docker exec \(embedContainer) pgrep -f uvicorn 2>/dev/null || echo ''")
+        // Check if already running
+        let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
         if !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "✓ Embedding server already running\n\nEndpoint: \(embedEndpoint)"
+            return "✓ \(serviceName) already running\n\nEndpoint: \(endpoint)"
         }
 
-        // Start uvicorn in background
-        let startCmd = "docker exec -d \(embedContainer) bash -c 'cd /workspace && python -m uvicorn embedding_server:app --host 0.0.0.0 --port 8080'"
+        // Start the service
+        let startCmd = "docker exec -d \(svc.container) bash -c '\(svc.startCmd)'"
         let (_, ok) = try await ssh(startCmd)
 
         if ok != 0 {
-            return "❌ Failed to start embedding server"
+            return "❌ Failed to start \(serviceName)"
         }
 
-        lines.append("✓ Starting embedding server...")
+        lines.append("✓ Starting \(serviceName)...")
+        if let desc = svc.description {
+            lines.append("")
+            lines.append("**Service:** \(desc)")
+        }
         lines.append("")
-        lines.append("**Model:** nvidia/llama-embed-nemotron-8b")
-        lines.append("**Note:** Takes ~90 seconds to load model and warm up")
-        lines.append("")
-        lines.append("Use `dgx_embed_status` to check when ready")
-        lines.append("**Endpoint:** \(embedEndpoint)")
+        lines.append("Use `dgx_service_status service:\(serviceName)` to check when ready")
+        lines.append("**Endpoint:** \(endpoint)")
 
         return lines.joined(separator: "\n")
     }
 
-    private static func embedStop() async throws -> String {
-        // Kill uvicorn process
-        let (_, ok) = try await ssh("docker exec \(embedContainer) pkill -f uvicorn 2>/dev/null; echo done")
+    private static func serviceStop(service serviceName: String) async throws -> String {
+        let config = try loadConfig()
+        guard let services = config.services, let svc = services[serviceName] else {
+            let available = config.services?.keys.sorted().joined(separator: ", ") ?? "none"
+            return "❌ Unknown service: \(serviceName)\n\nAvailable: \(available)"
+        }
+
+        // Kill the process
+        let (_, ok) = try await ssh("docker exec \(svc.container) pkill -f '\(svc.process)' 2>/dev/null; echo done")
 
         if ok == 0 {
-            return "✓ Embedding server stopped\n\nContainer \(embedContainer) still running (use `dgx_stop` to stop container)"
+            return "✓ \(serviceName) stopped\n\nContainer \(svc.container) still running (use `dgx_stop` to stop container)"
         } else {
-            return "⚠️ Server may not have been running"
+            return "⚠️ Service may not have been running"
         }
     }
 
@@ -1173,17 +1593,56 @@ enum DGX {
         let projectName = resolvedProjectName
 
         let excludes = project.exclude.map { "--exclude='\($0)'" }.joined(separator: " ")
+        // Sync to ~/{project_name} on host - container volume mount maps this to container path
         let hostPath = "~/\(projectName)"
         var out = ""
+
+        // Validate: Check that host directory exists and is user-owned
+        if direction == "push" {
+            let (dirCheck, _) = try await ssh("stat -c '%U' \(hostPath) 2>/dev/null || echo 'NOT_FOUND'")
+            let owner = dirCheck.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if owner == "NOT_FOUND" {
+                var err = "❌ Host directory '\(hostPath)' does not exist.\n\n"
+                err += "**Setup required:**\n"
+                err += "The container needs to be created with the correct volume mount.\n\n"
+                err += "Option 1: Use dgx_container_create (recommended)\n"
+                err += "  - First add container to config: dgx_config_add_container\n"
+                err += "  - Then create it: dgx_container_create container:\(project.container)\n\n"
+                err += "Option 2: Manual setup\n"
+                err += "  1. Create directory: ssh \(host) 'mkdir -p \(hostPath)'\n"
+                err += "  2. Recreate container with mount: -v \(hostPath):\(project.remote)"
+                return err
+            }
+
+            // Get current user on host to verify ownership
+            let (currentUser, _) = try await ssh("whoami")
+            let expectedUser = currentUser.trimmingCharacters(in: .whitespacesAndNewlines)
+            if owner != expectedUser && owner != "root" {
+                out += "⚠️ Warning: '\(hostPath)' owned by '\(owner)', expected '\(expectedUser)'\n"
+            } else if owner == "root" {
+                var err = "❌ Host directory '\(hostPath)' is owned by root.\n\n"
+                err += "This usually happens when Docker created the directory.\n\n"
+                err += "**Fix:** Run on DGX: sudo chown -R \(expectedUser):\(expectedUser) \(hostPath)"
+                return err
+            }
+        }
 
         if direction == "push" {
             out += "Pushing \(projectName) to DGX...\n"
             let (result, _) = try await shell("rsync -avz \(excludes) \(project.local)/ \(host):\(hostPath)/")
             out += result
         } else {
-            out += "Pulling results from \(projectName)...\n"
-            let (result, _) = try await shell("rsync -avz \(host):\(hostPath)/data/results/ \(project.local)/data/results/")
-            out += result
+            // Pull: if results field is set, only pull that subdirectory; otherwise pull whole project
+            if let resultsDir = project.results {
+                out += "Pulling \(resultsDir)/ from \(projectName)...\n"
+                let (result, _) = try await shell("rsync -avz \(host):\(hostPath)/\(resultsDir)/ \(project.local)/\(resultsDir)/")
+                out += result
+            } else {
+                out += "Pulling \(projectName) from DGX...\n"
+                let (result, _) = try await shell("rsync -avz \(excludes) \(host):\(hostPath)/ \(project.local)/")
+                out += result
+            }
         }
 
         // Update state
