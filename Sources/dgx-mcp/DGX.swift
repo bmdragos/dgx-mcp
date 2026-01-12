@@ -13,7 +13,7 @@ enum DGX {
     static let tools: [MCP.Tool] = [
         MCP.Tool(
             name: "dgx_status",
-            description: "Show DGX Spark status: host connectivity, GPU info, container states, and project sync times",
+            description: "Overview of DGX Spark: host connectivity, GPU memory/utilization, all container states, and last sync times. Start here to understand system state.",
             inputSchema: ["type": "object", "properties": [:] as [String: Any], "required": [] as [String]]
         ),
         MCP.Tool(
@@ -28,35 +28,35 @@ enum DGX {
         ),
         MCP.Tool(
             name: "dgx_sync",
-            description: "Sync project files between local machine and DGX Spark",
+            description: "Sync project files via rsync. Push sends local code to DGX, pull retrieves results. Uses config.json for paths and exclusions. Always push before running code.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "direction": ["type": "string", "enum": ["push", "pull"], "description": "push = local to DGX, pull = DGX results to local"],
-                    "project": ["type": "string", "description": "Project name (optional, auto-detected from cwd)"]
+                    "direction": ["type": "string", "enum": ["push", "pull"], "description": "push = local code to DGX, pull = DGX results to local"],
+                    "project": ["type": "string", "description": "Project name from config.json (auto-detected from cwd if omitted)"]
                 ] as [String: Any],
                 "required": ["direction"] as [String]
             ]
         ),
         MCP.Tool(
             name: "dgx_run",
-            description: "Full workflow: sync code to DGX, run command in container, sync results back. Use for running experiments.",
+            description: "Full workflow: push code, run command, pull results. For long jobs, use dgx_job_start instead (returns immediately). For services, use dgx_service_* tools.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "command": ["type": "string", "description": "Command to run in container (e.g., 'python run_gpu.py --K 1e9')"],
-                    "project": ["type": "string", "description": "Project name"]
+                    "command": ["type": "string", "description": "Command to run (e.g., 'python train.py --epochs 10')"],
+                    "project": ["type": "string", "description": "Project name from config.json"]
                 ] as [String: Any],
                 "required": ["command"] as [String]
             ]
         ),
         MCP.Tool(
             name: "dgx_exec",
-            description: "Run a command in the DGX container without syncing. For quick commands.",
+            description: "Run a one-off command in a container. For services defined in config.json, use dgx_service_start/stop/restart instead. Use this for quick inspections, package installs, or ad-hoc commands.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "command": ["type": "string", "description": "Command to run"],
+                    "command": ["type": "string", "description": "Command to run (e.g., 'pip list', 'nvidia-smi', 'ls -la')"],
                     "container": ["type": "string", "description": "Container name (default: twinprime)"]
                 ] as [String: Any],
                 "required": ["command"] as [String]
@@ -88,22 +88,22 @@ enum DGX {
         ),
         MCP.Tool(
             name: "dgx_start",
-            description: "Start a stopped container",
+            description: "Start a stopped Docker container. Note: this starts the container, not a service inside it. Use dgx_service_start to start a service process.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "container": ["type": "string", "description": "Container name (default: twinprime)"]
+                    "container": ["type": "string", "description": "Container name from config.json (default: twinprime)"]
                 ] as [String: Any],
                 "required": [] as [String]
             ]
         ),
         MCP.Tool(
             name: "dgx_stop",
-            description: "Stop a running container",
+            description: "Stop a running Docker container. This stops the entire container (all processes inside). To stop just a service, use dgx_service_stop instead.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "container": ["type": "string", "description": "Container name (default: twinprime)"]
+                    "container": ["type": "string", "description": "Container name from config.json (default: twinprime)"]
                 ] as [String: Any],
                 "required": [] as [String]
             ]
@@ -134,36 +134,47 @@ enum DGX {
             description: "Stop the embedding server gracefully",
             inputSchema: ["type": "object", "properties": [:] as [String: Any], "required": [] as [String]]
         ),
-        // MARK: - Generic Service Tools
+        // MARK: - Service Lifecycle Tools (use these instead of dgx_exec for services)
         MCP.Tool(
             name: "dgx_service_status",
-            description: "Check service status. Lists all services if no service specified, or details for a specific service.",
+            description: "Check if a service is running and healthy. Lists all configured services if no name specified. Shows endpoint URL, health status, and process info.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference'). Lists all if omitted."]
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'demucs'). Lists all if omitted."]
                 ] as [String: Any],
                 "required": [] as [String]
             ]
         ),
         MCP.Tool(
             name: "dgx_service_start",
-            description: "Start a service defined in config.json",
+            description: "Start a service defined in config.json. Handles container startup, working directory, and backgrounding automatically. Use dgx_service_restart to reload code changes.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference')"]
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'demucs')"]
                 ] as [String: Any],
                 "required": ["service"] as [String]
             ]
         ),
         MCP.Tool(
             name: "dgx_service_stop",
-            description: "Stop a running service",
+            description: "Stop a running service. Sends SIGTERM, waits, then SIGKILL if needed. Use dgx_service_restart to stop and start in one call.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'onnx-inference')"]
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'demucs')"]
+                ] as [String: Any],
+                "required": ["service"] as [String]
+            ]
+        ),
+        MCP.Tool(
+            name: "dgx_service_restart",
+            description: "Restart a service (stop then start). Use this to reload code changes or recover from issues. Preferred over manual stop+start.",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "service": ["type": "string", "description": "Service name (e.g., 'embedding', 'demucs')"]
                 ] as [String: Any],
                 "required": ["service"] as [String]
             ]
@@ -431,11 +442,11 @@ enum DGX {
         ),
         MCP.Tool(
             name: "dgx_container_create",
-            description: "Create a Docker container on DGX with correct volume mounts for associated projects. Creates host directories, then runs docker with per-project mounts mapping ~/{project} to {remote} in container.",
+            description: "Create a new Docker container with proper volume mounts. REQUIRED before first dgx_sync. Creates host directories and mounts ~/{project} to {remote} path. Use dgx_config_add_container first to add config.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "container": ["type": "string", "description": "Container name from config"],
+                    "container": ["type": "string", "description": "Container name from config.json"],
                     "ports": ["type": "array", "items": ["type": "string"], "description": "Port mappings (e.g., ['8081:8081'])"]
                 ] as [String: Any],
                 "required": ["container"] as [String]
@@ -443,12 +454,12 @@ enum DGX {
         ),
         MCP.Tool(
             name: "dgx_install",
-            description: "Install apt packages in a container. Runs apt-get update && apt-get install.",
+            description: "Install apt packages in a container (apt-get update && apt-get install -y). Use this instead of dgx_exec for package installation.",
             inputSchema: [
                 "type": "object",
                 "properties": [
-                    "packages": ["type": "array", "items": ["type": "string"], "description": "Package names to install (e.g., ['ffmpeg', 'vim'])"],
-                    "container": ["type": "string", "description": "Container name (default: from config)"]
+                    "packages": ["type": "array", "items": ["type": "string"], "description": "Package names (e.g., ['ffmpeg', 'vim', 'htop'])"],
+                    "container": ["type": "string", "description": "Container name from config.json"]
                 ] as [String: Any],
                 "required": ["packages"] as [String]
             ]
@@ -478,6 +489,9 @@ enum DGX {
         case "dgx_service_stop":
             guard let svc = args["service"] as? String else { throw MCPError.unknownTool("dgx_service_stop requires service") }
             return try await serviceStop(service: svc)
+        case "dgx_service_restart":
+            guard let svc = args["service"] as? String else { throw MCPError.unknownTool("dgx_service_restart requires service") }
+            return try await serviceRestart(service: svc)
         case "dgx_exec":
             guard let cmd = args["command"] as? String else { throw MCPError.unknownTool("dgx_exec requires command") }
             return try await exec(command: cmd, container: args["container"] as? String)
@@ -1592,6 +1606,36 @@ enum DGX {
         }
 
         return "✓ \(serviceName) stopped\n\nContainer \(svc.container) still running (use `dgx_stop` to stop container)"
+    }
+
+    private static func serviceRestart(service serviceName: String) async throws -> String {
+        var lines: [String] = []
+
+        // Stop the service (if running)
+        let stopResult = try await serviceStop(service: serviceName)
+        if stopResult.contains("❌") {
+            return stopResult  // Failed to stop
+        }
+        if !stopResult.contains("was not running") {
+            lines.append("✓ Stopped \(serviceName)")
+        }
+
+        // Brief pause to ensure clean shutdown
+        try await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
+
+        // Start the service
+        let startResult = try await serviceStart(service: serviceName)
+        if startResult.contains("❌") {
+            return startResult  // Failed to start
+        }
+
+        // Extract endpoint from start result
+        if let range = startResult.range(of: "**Endpoint:**") {
+            lines.append(String(startResult[range.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        lines.insert("✓ \(serviceName) restarted", at: 0)
+        return lines.joined(separator: "\n")
     }
 
     private static func exec(command: String, container: String?) async throws -> String {
