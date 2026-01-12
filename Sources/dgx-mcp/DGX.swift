@@ -595,8 +595,9 @@ enum DGX {
             var port: Int
             var health: String?
             var description: String?
+            var project: String?  // Optional: link to project for auto-derived working directory
             enum CodingKeys: String, CodingKey {
-                case container, process, startCmd = "start_cmd", port, health, description
+                case container, process, startCmd = "start_cmd", port, health, description, project
             }
         }
 
@@ -916,6 +917,16 @@ enum DGX {
             throw MCPError.unknownTool("No 'spark' host configured")
         }
         return host.ssh
+    }
+
+    /// Check for non-zombie processes matching pattern in container
+    /// Returns PIDs of running (non-zombie) processes
+    private static func checkProcessRunning(container: String, pattern: String) async throws -> String {
+        // Use ps with state filtering - simpler and more reliable than parsing /proc
+        // STAT column shows 'Z' for zombies, filter those out
+        let cmd = "docker exec \(container) sh -c \"ps -eo pid,stat,args 2>/dev/null | grep '\(pattern)' | grep -v grep | grep -v ' Z' | awk '{print \\$1}'\""
+        let (out, _) = try await ssh(cmd)
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Shell Helpers
@@ -1395,7 +1406,7 @@ enum DGX {
             var lines: [String] = ["## Services"]
             lines.append("")
             for (name, svc) in services.sorted(by: { $0.key < $1.key }) {
-                let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
+                let procOut = try await checkProcessRunning(container: svc.container, pattern: svc.process)
                 let running = !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 let status = running ? "🟢" : "🔴"
                 let desc = svc.description ?? svc.container
@@ -1430,7 +1441,7 @@ enum DGX {
         }
 
         // Check if process is running
-        let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
+        let procOut = try await checkProcessRunning(container: svc.container, pattern: svc.process)
         let processRunning = !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         if !processRunning {
@@ -1501,13 +1512,35 @@ enum DGX {
         }
 
         // Check if already running
-        let (procOut, _) = try await ssh("docker exec \(svc.container) pgrep -f '\(svc.process)' 2>/dev/null || echo ''")
+        let procOut = try await checkProcessRunning(container: svc.container, pattern: svc.process)
         if !procOut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "✓ \(serviceName) already running\n\nEndpoint: \(endpoint)"
         }
 
-        // Start the service
-        let startCmd = "docker exec -d \(svc.container) bash -c '\(svc.startCmd)'"
+        // Derive working directory from linked project (if set)
+        var workdir: String? = nil
+        if let projectName = svc.project {
+            if let project = config.projects[projectName] {
+                // Use project's remote path (container path from volume mount)
+                workdir = project.remote
+                lines.append("Using project '\(projectName)' workdir: \(workdir!)")
+            } else {
+                return "❌ Service references project '\(projectName)' but it doesn't exist in config"
+            }
+        }
+
+        // Build the full command with optional cd
+        let fullCmd: String
+        if let wd = workdir {
+            fullCmd = "cd \(wd) && \(svc.startCmd)"
+        } else {
+            fullCmd = svc.startCmd
+        }
+
+        // Start the service in background
+        // Wrap entire command in subshell so && chains are backgrounded together
+        let escapedCmd = fullCmd.replacingOccurrences(of: "\"", with: "\\\"")
+        let startCmd = "docker exec \(svc.container) bash -c \"nohup bash -c \\\"\(escapedCmd)\\\" >/dev/null 2>&1 &\""
         let (_, ok) = try await ssh(startCmd)
 
         if ok != 0 {
@@ -1533,14 +1566,32 @@ enum DGX {
             return "❌ Unknown service: \(serviceName)\n\nAvailable: \(available)"
         }
 
-        // Kill the process
-        let (_, ok) = try await ssh("docker exec \(svc.container) pkill -f '\(svc.process)' 2>/dev/null; echo done")
-
-        if ok == 0 {
-            return "✓ \(serviceName) stopped\n\nContainer \(svc.container) still running (use `dgx_stop` to stop container)"
-        } else {
-            return "⚠️ Service may not have been running"
+        // Check if running first
+        let procBefore = try await checkProcessRunning(container: svc.container, pattern: svc.process)
+        if procBefore.isEmpty {
+            return "⚠️ \(serviceName) was not running"
         }
+
+        // Kill the process (SIGTERM first, then SIGKILL)
+        let _ = try await ssh("docker exec \(svc.container) pkill -f '\(svc.process)' 2>/dev/null || true")
+
+        // Wait briefly and verify it's dead
+        try await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
+
+        let procAfter = try await checkProcessRunning(container: svc.container, pattern: svc.process)
+        if !procAfter.isEmpty {
+            // Still running, force kill
+            let _ = try await ssh("docker exec \(svc.container) pkill -9 -f '\(svc.process)' 2>/dev/null || true")
+            try await Task.sleep(nanoseconds: 500_000_000)
+
+            // Check again
+            let procFinal = try await checkProcessRunning(container: svc.container, pattern: svc.process)
+            if !procFinal.isEmpty {
+                return "❌ Failed to stop \(serviceName) - process still running. May need container restart."
+            }
+        }
+
+        return "✓ \(serviceName) stopped\n\nContainer \(svc.container) still running (use `dgx_stop` to stop container)"
     }
 
     private static func exec(command: String, container: String?) async throws -> String {
