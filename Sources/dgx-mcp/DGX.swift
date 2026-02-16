@@ -1211,6 +1211,16 @@ enum DGX {
         writeJobCache(cache)
     }
 
+    /// Resolve container for a job — checks cache, falls back to default
+    private static func resolveContainer(for jobId: String, explicit: String?) -> String {
+        if let c = explicit { return c }
+        if let cache = readJobCache() {
+            if cache.running?.id == jobId { return cache.container }
+            if cache.recent.contains(where: { $0.id == jobId }) { return cache.container }
+        }
+        return "twinprime"
+    }
+
     /// Mark running job as killed (called from jobKill)
     private static func markJobKilledInCache(jobId: String) {
         guard var cache = readJobCache() else { return }
@@ -2447,7 +2457,7 @@ enum DGX {
     }
 
     private static func jobLog(jobId: String, container: String?, lines: Int?) async throws -> String {
-        let containerName = container ?? "twinprime"
+        let containerName = resolveContainer(for: jobId, explicit: container)
         let n = lines ?? 50
 
         let logFile = "\(jobsDir)/\(jobId).log"
@@ -2505,7 +2515,7 @@ enum DGX {
     }
 
     private static func jobKill(jobId: String, container: String?) async throws -> String {
-        let containerName = container ?? "twinprime"
+        let containerName = resolveContainer(for: jobId, explicit: container)
 
         // Get PID
         let (pid, ok) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).pid 2>/dev/null")
@@ -2530,7 +2540,7 @@ enum DGX {
     // MARK: - Job Retry
 
     private static func jobRetry(jobId: String, container: String?) async throws -> String {
-        let containerName = container ?? "twinprime"
+        let containerName = resolveContainer(for: jobId, explicit: container)
 
         // Get the original command
         let (cmd, ok) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).cmd 2>/dev/null")
@@ -2596,7 +2606,7 @@ enum DGX {
     // MARK: - Job Watch (with diff and GPU stats)
 
     private static func jobWatch(jobId: String, container: String?) async throws -> String {
-        let containerName = container ?? "twinprime"
+        let containerName = resolveContainer(for: jobId, explicit: container)
         let logFile = "\(jobsDir)/\(jobId).log"
 
         // Load state to get last read position
