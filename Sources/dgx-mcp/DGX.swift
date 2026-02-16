@@ -2546,7 +2546,7 @@ enum DGX {
         let (_, killOk) = try await ssh("docker exec \(containerName) pkill -P \(pidNum); kill \(pidNum) 2>/dev/null")
 
         // Update status
-        let _ = try await ssh("docker exec \(containerName) echo 'killed' > \(jobsDir)/\(jobId).status")
+        let _ = try await ssh("docker exec \(containerName) bash -c 'echo killed > \(jobsDir)/\(jobId).status'")
 
         // Update local job cache for DGXDash
         markJobKilledInCache(jobId: jobId)
