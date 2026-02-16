@@ -2591,43 +2591,40 @@ enum DGX {
         let hours = olderThanHours ?? 24
         let keep = keepLast ?? 5
 
-        // Get all job IDs sorted by time (newest first)
-        let (files, ok) = try await ssh("docker exec \(containerName) bash -c 'ls -t \(jobsDir)/*.status 2>/dev/null || echo \"\"'")
-        if ok != 0 || files.isEmpty {
+        // Single SSH call: list jobs, skip N newest, remove old ones
+        let script = """
+            cd \(jobsDir) 2>/dev/null || exit 0
+            now=$(date +%s)
+            cutoff=$((now - \(hours) * 3600))
+            removed=0
+            kept=0
+            i=0
+            for f in $(ls -t *.status 2>/dev/null); do
+                job=$(basename "$f" .status)
+                i=$((i + 1))
+                if [ $i -le \(keep) ]; then
+                    kept=$((kept + 1))
+                    continue
+                fi
+                start=$(cat "$job.start" 2>/dev/null || echo 0)
+                if [ "$start" -lt "$cutoff" ] 2>/dev/null; then
+                    rm -f "$job".* 2>/dev/null
+                    removed=$((removed + 1))
+                else
+                    kept=$((kept + 1))
+                fi
+            done
+            echo "$removed|$kept"
+            """
+
+        let (output, ok) = try await ssh("docker exec \(containerName) bash -c '\(script.replacingOccurrences(of: "'", with: "'\"'\"'"))'")
+        if ok != 0 || output.isEmpty {
             return "No jobs to clean"
         }
 
-        let allJobs = files.split(separator: "\n").map { statusFile -> String in
-            String(statusFile).replacingOccurrences(of: "\(jobsDir)/", with: "").replacingOccurrences(of: ".status", with: "")
-        }
-
-        // Get current timestamp
-        let (nowStr, _) = try await ssh("docker exec \(containerName) date +%s")
-        let now = Int(nowStr.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        let cutoff = now - (hours * 3600)
-
-        var removed = 0
-        var kept = 0
-
-        for (index, jobId) in allJobs.enumerated() {
-            // Always keep the N most recent
-            if index < keep {
-                kept += 1
-                continue
-            }
-
-            // Check job age
-            let (startStr, startOk) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).start 2>/dev/null")
-            if startOk == 0, let start = Int(startStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                if start < cutoff {
-                    // Remove all files for this job
-                    let _ = try await ssh("docker exec \(containerName) rm -f \(jobsDir)/\(jobId).* 2>/dev/null")
-                    removed += 1
-                } else {
-                    kept += 1
-                }
-            }
-        }
+        let parts = output.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "|")
+        let removed = parts.first.flatMap { Int($0) } ?? 0
+        let kept = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
 
         return "Cleaned up \(removed) old jobs, kept \(kept) recent jobs"
     }
