@@ -1012,7 +1012,19 @@ enum DGX {
         let escaped = command.replacingOccurrences(of: "'", with: "'\"'\"'")
         let controlPath = "-o ControlPath=\(sshControlPath)"
         let opts = sshControlOpts.joined(separator: " ")
-        return try await shell("ssh \(opts) \(controlPath) \(host) '\(escaped)'")
+        let sshCmd = "ssh \(opts) \(controlPath) \(host) '\(escaped)'"
+
+        let (out, code) = try await shell(sshCmd)
+
+        // Retry once on SSH transport failures (exit 255 = connection refused, timeout, broken pipe)
+        if code == 255 {
+            // Clear stale control socket before retry
+            let _ = try? await shell("ssh -o ControlPath=\(sshControlPath) -O exit \(host) 2>/dev/null", timeout: 5)
+            try await Task.sleep(nanoseconds: 2_000_000_000)  // 2s backoff
+            return try await shell(sshCmd)
+        }
+
+        return (out, code)
     }
 
     // MARK: - Job Cache for DGXDash
@@ -1678,8 +1690,21 @@ enum DGX {
         let timeoutSec = timeout ?? 30
         let execId = "exec_\(Int(Date().timeIntervalSince1970))"
 
+        // Check container is running before attempting exec
+        let (containerStatus, statusOk) = try await ssh("docker inspect \(containerName) --format '{{.State.Status}}'")
+        let status = containerStatus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if statusOk != 0 {
+            return "Container '\(containerName)' not found. Use dgx_containers to see available containers."
+        }
+        if status != "running" {
+            return "Container '\(containerName)' is \(status). Start it first:\n  dgx_exec(command: \"docker start \(containerName)\") or use dgx_status to check."
+        }
+
         // Ensure jobs dir exists
-        let _ = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
+        let (mkdirOut, mkdirOk) = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
+        if mkdirOk != 0 {
+            return "Failed to create jobs directory in \(containerName): \(mkdirOut)"
+        }
 
         // Run detached — same pattern as jobStart(): interpolate command directly into script,
         // escape only the outer docker exec bash -c "..." wrapper
@@ -1689,10 +1714,10 @@ enum DGX {
             echo $? > \(jobsDir)/\(execId).exit
             """
         let dockerCmd = "docker exec -d \(containerName) bash -c \"\(script.replacingOccurrences(of: "\"", with: "\\\""))\""
-        let (_, ok) = try await ssh(dockerCmd)
+        let (execOut, ok) = try await ssh(dockerCmd)
 
         guard ok == 0 else {
-            return "Failed to start command"
+            return "Failed to start command in \(containerName): \(execOut)"
         }
 
         // Async poll — each iteration yields the cooperative thread
@@ -2108,10 +2133,10 @@ enum DGX {
 
         // Run detached
         let dockerCmd = "docker exec -d \(containerName) bash -c \"\(script.replacingOccurrences(of: "\"", with: "\\\""))\""
-        let (_, ok) = try await ssh(dockerCmd)
+        let (jobOut, ok) = try await ssh(dockerCmd)
 
         if ok != 0 {
-            return "Failed to start job"
+            return "Failed to start job in \(containerName): \(jobOut)"
         }
 
         // Update local job cache for DGXDash
