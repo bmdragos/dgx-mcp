@@ -1873,19 +1873,24 @@ enum DGX {
         let syncResult = try await sync(direction: "push", project: projectName)
         out += syncResult + "\n"
 
-        // 3. Run command
+        // 3. Run command (120s timeout — use dgx_job_start for longer tasks)
         out += "\n3. Running: \(command)\n"
         out += String(repeating: "-", count: 40) + "\n"
-        let execResult = try await exec(command: command, container: container)
+        let execResult = try await exec(command: command, container: container, timeout: 120)
         out += execResult + "\n"
         out += String(repeating: "-", count: 40) + "\n"
 
-        // 4. Sync results
-        out += "\n4. Syncing results...\n"
-        let pullResult = try await sync(direction: "pull", project: projectName)
-        out += pullResult + "\n"
+        // 4. Sync results (skip if command was promoted to background)
+        if execResult.contains("promoted to background") {
+            out += "\n4. Skipping result sync — command still running.\n"
+            out += "   Use dgx_job_log to check progress, then dgx_sync(direction: \"pull\") when done."
+        } else {
+            out += "\n4. Syncing results...\n"
+            let pullResult = try await sync(direction: "pull", project: projectName)
+            out += pullResult + "\n"
+            out += "\n=== Complete ==="
+        }
 
-        out += "\n=== Complete ==="
         return out
     }
 
