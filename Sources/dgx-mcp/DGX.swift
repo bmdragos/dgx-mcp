@@ -2045,86 +2045,56 @@ enum DGX {
         return truncated + "\n\n... truncated (\(shownLines)/\(lineCount) lines, \(text.utf8.count / 1024)KB total) — use dgx_job_log with lines parameter to page through"
     }
 
-    // MARK: - Pre-flight GPU Check
-
-    struct PreflightResult {
-        let canProceed: Bool
-        let warnings: [String]
-        let gpuUtil: Int
-        let gpuMemUsedGB: Double
-        let gpuMemTotalGB: Double
-        let runningJobs: Int
-    }
-
-    /// Check GPU status before starting a job
-    private static func preflightCheck(container: String?) async throws -> PreflightResult {
-        var warnings: [String] = []
-
-        // Check GPU utilization and memory
-        let (gpuInfo, gpuOk) = try await ssh("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits")
-
-        var gpuUtil = 0
-        var gpuMemUsed: Double = 0
-        var gpuMemTotal: Double = 128.0  // Default for GB10
-
-        if gpuOk == 0 {
-            let parts = gpuInfo.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            if parts.count >= 3 {
-                gpuUtil = Int(parts[0]) ?? 0
-                gpuMemUsed = (Double(parts[1]) ?? 0) / 1024.0  // MiB to GB
-                gpuMemTotal = (Double(parts[2]) ?? 128000) / 1024.0
-            }
-
-            // Check utilization
-            if gpuUtil > 50 {
-                warnings.append("⚠️  GPU utilization is \(gpuUtil)% - another process may be using it")
-            }
-
-            // Check memory
-            let memUsedPct = (gpuMemUsed / gpuMemTotal) * 100
-            if memUsedPct > 50 {
-                warnings.append("⚠️  GPU memory is \(String(format: "%.0f", memUsedPct))% used (\(String(format: "%.1f", gpuMemUsed))/\(String(format: "%.0f", gpuMemTotal)) GB)")
-            }
-        }
-
-        // Check for running jobs
-        let containerName = container ?? "twinprime"
-        let (runningStatus, _) = try await ssh("docker exec \(containerName) bash -c 'grep -l running \(jobsDir)/*.status 2>/dev/null | wc -l'")
-        let runningJobs = Int(runningStatus.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-
-        if runningJobs > 0 {
-            warnings.append("⚠️  \(runningJobs) job(s) already running - resources may be contested")
-        }
-
-        return PreflightResult(
-            canProceed: true,  // We warn but don't block
-            warnings: warnings,
-            gpuUtil: gpuUtil,
-            gpuMemUsedGB: gpuMemUsed,
-            gpuMemTotalGB: gpuMemTotal,
-            runningJobs: runningJobs
-        )
-    }
-
     private static func jobStart(command: String, name: String?, container: String?, workdir: String?) async throws -> String {
         let containerName = container ?? "twinprime"
         let dir = workdir ?? "/workspace"
 
-        // Pre-flight GPU check
-        let preflight = try await preflightCheck(container: containerName)
-
         // Generate job ID: timestamp-based for sorting
         let jobId = "job_\(Int(Date().timeIntervalSince1970))"
 
-        // Ensure jobs directory exists
-        let _ = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
-
-        // Write .cmd file via base64 to avoid all escaping issues with quotes/special chars
+        // Single SSH call: preflight + mkdir + write metadata + write status
         let cmdBase64 = Data(command.utf8).base64EncodedString()
-        let _ = try await ssh("docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(jobId).cmd'")
+        let setupScript = """
+            nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || echo "0, 0, 128000"
+            echo "---PREFLIGHT---"
+            docker exec \(containerName) bash -c 'grep -l running \(jobsDir)/*.status 2>/dev/null | wc -l' 2>/dev/null || echo "0"
+            echo "---SETUP---"
+            docker exec \(containerName) mkdir -p \(jobsDir) && \
+            docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(jobId).cmd && echo running > \(jobsDir)/\(jobId).status && date +%s > \(jobsDir)/\(jobId).start' && \
+            echo "OK" || echo "FAIL"
+            """
+        let (setupOut, _) = try await ssh(setupScript)
+        let sections = setupOut.components(separatedBy: "---PREFLIGHT---")
 
-        // Write .status and .start BEFORE detached launch so dgx_jobs sees the job immediately
-        let _ = try await ssh("docker exec \(containerName) bash -c 'echo running > \(jobsDir)/\(jobId).status && date +%s > \(jobsDir)/\(jobId).start'")
+        // Parse preflight GPU info
+        var gpuUtil = 0
+        var gpuMemUsed: Double = 0
+        var gpuMemTotal: Double = 128.0
+        var warnings: [String] = []
+
+        if let gpuLine = sections.first?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let parts = gpuLine.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            if parts.count >= 3 {
+                gpuUtil = Int(parts[0]) ?? 0
+                gpuMemUsed = (Double(parts[1]) ?? 0) / 1024.0
+                gpuMemTotal = (Double(parts[2]) ?? 128000) / 1024.0
+            }
+            if gpuUtil > 50 { warnings.append("⚠️  GPU utilization is \(gpuUtil)% - another process may be using it") }
+            let memPct = (gpuMemUsed / gpuMemTotal) * 100
+            if memPct > 50 { warnings.append("⚠️  GPU memory is \(String(format: "%.0f", memPct))% used (\(String(format: "%.1f", gpuMemUsed))/\(String(format: "%.0f", gpuMemTotal)) GB)") }
+        }
+
+        // Parse running jobs + setup result
+        if sections.count > 1 {
+            let rest = sections[1].components(separatedBy: "---SETUP---")
+            if let jobsLine = rest.first?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                let runningJobs = Int(jobsLine) ?? 0
+                if runningJobs > 0 { warnings.append("⚠️  \(runningJobs) job(s) already running - resources may be contested") }
+            }
+            if let setupResult = rest.last?.trimmingCharacters(in: .whitespacesAndNewlines), setupResult != "OK" {
+                return "Failed to set up job in \(containerName)"
+            }
+        }
 
         // Create the job script that handles logging and status
         // PYTHONUNBUFFERED=1 ensures real-time log output for Python scripts
@@ -2155,12 +2125,12 @@ enum DGX {
         out += "Workdir: \(dir)\n"
 
         // Show GPU status
-        out += "GPU: \(preflight.gpuUtil)% util | \(String(format: "%.1f", preflight.gpuMemUsedGB))/\(String(format: "%.0f", preflight.gpuMemTotalGB)) GB\n"
+        out += "GPU: \(gpuUtil)% util | \(String(format: "%.1f", gpuMemUsed))/\(String(format: "%.0f", gpuMemTotal)) GB\n"
 
         // Show pre-flight warnings if any
-        if !preflight.warnings.isEmpty {
+        if !warnings.isEmpty {
             out += "\n"
-            for warning in preflight.warnings {
+            for warning in warnings {
                 out += "\(warning)\n"
             }
         }
