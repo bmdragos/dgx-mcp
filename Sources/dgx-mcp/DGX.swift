@@ -1211,12 +1211,23 @@ enum DGX {
         writeJobCache(cache)
     }
 
-    /// Resolve container for a job — checks cache, falls back to default
-    private static func resolveContainer(for jobId: String, explicit: String?) -> String {
+    /// Resolve container for a job — checks cache, then probes all known containers
+    private static func resolveContainer(for jobId: String, explicit: String?) async -> String {
         if let c = explicit { return c }
+        // Check local cache first
         if let cache = readJobCache() {
             if cache.running?.id == jobId { return cache.container }
             if cache.recent.contains(where: { $0.id == jobId }) { return cache.container }
+            // If no match but cache has a container, try it first (most likely correct)
+        }
+        // Probe all known containers for the job file
+        if let config = try? loadConfig() {
+            for name in config.containers.keys {
+                if let (_, ok) = try? await ssh("docker exec \(name) test -f \(jobsDir)/\(jobId).status 2>/dev/null"),
+                   ok == 0 {
+                    return name
+                }
+            }
         }
         return "twinprime"
     }
@@ -2457,7 +2468,7 @@ enum DGX {
     }
 
     private static func jobLog(jobId: String, container: String?, lines: Int?) async throws -> String {
-        let containerName = resolveContainer(for: jobId, explicit: container)
+        let containerName = await resolveContainer(for: jobId, explicit: container)
         let n = lines ?? 50
 
         let logFile = "\(jobsDir)/\(jobId).log"
@@ -2515,7 +2526,7 @@ enum DGX {
     }
 
     private static func jobKill(jobId: String, container: String?) async throws -> String {
-        let containerName = resolveContainer(for: jobId, explicit: container)
+        let containerName = await resolveContainer(for: jobId, explicit: container)
 
         // Get PID
         let (pid, ok) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).pid 2>/dev/null")
@@ -2540,7 +2551,7 @@ enum DGX {
     // MARK: - Job Retry
 
     private static func jobRetry(jobId: String, container: String?) async throws -> String {
-        let containerName = resolveContainer(for: jobId, explicit: container)
+        let containerName = await resolveContainer(for: jobId, explicit: container)
 
         // Get the original command
         let (cmd, ok) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).cmd 2>/dev/null")
@@ -2606,7 +2617,7 @@ enum DGX {
     // MARK: - Job Watch (with diff and GPU stats)
 
     private static func jobWatch(jobId: String, container: String?) async throws -> String {
-        let containerName = resolveContainer(for: jobId, explicit: container)
+        let containerName = await resolveContainer(for: jobId, explicit: container)
         let logFile = "\(jobsDir)/\(jobId).log"
 
         // Load state to get last read position
