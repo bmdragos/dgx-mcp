@@ -1731,7 +1731,7 @@ enum DGX {
                 // Completed — return output inline, clean up temp files
                 let (output, _) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(execId).log")
                 let _ = try await ssh("docker exec \(containerName) rm -f \(jobsDir)/\(execId).log \(jobsDir)/\(execId).exit 2>/dev/null")
-                return output
+                return truncateOutput(output)
             }
         }
 
@@ -2043,6 +2043,15 @@ enum DGX {
     // MARK: - Background Jobs
 
     private static let jobsDir = "/workspace/.jobs"
+    private static let maxOutputBytes = 50_000  // 50KB cap to prevent STDIO pipe overload
+
+    private static func truncateOutput(_ text: String) -> String {
+        guard text.utf8.count > maxOutputBytes else { return text }
+        let truncated = String(text.utf8.prefix(maxOutputBytes))!
+        let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        let shownLines = truncated.split(separator: "\n", omittingEmptySubsequences: false).count
+        return truncated + "\n\n... truncated (\(shownLines)/\(lineCount) lines, \(text.utf8.count / 1024)KB total) — use dgx_job_log with lines parameter to page through"
+    }
 
     // MARK: - Pre-flight GPU Check
 
@@ -2528,7 +2537,7 @@ enum DGX {
 
         out += log
 
-        return out
+        return truncateOutput(out)
     }
 
     private static func jobKill(jobId: String, container: String?) async throws -> String {
