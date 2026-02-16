@@ -19,6 +19,7 @@ enum MCP {
         tools: [Tool],
         handler: @escaping (String, [String: Any]) async throws -> String
     ) async {
+        signal(SIGPIPE, SIG_IGN)  // Don't die on broken STDIO pipe
         setbuf(stdout, nil)
         setbuf(stderr, nil)
         log("\(name) MCP server starting...")

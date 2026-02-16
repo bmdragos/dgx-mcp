@@ -52,12 +52,13 @@ enum DGX {
         ),
         MCP.Tool(
             name: "dgx_exec",
-            description: "Run a one-off command in a container. For services defined in config.json, use dgx_service_start/stop/restart instead. Use this for quick inspections, package installs, or ad-hoc commands.",
+            description: "Run a command in a container. Returns output inline for fast commands (< timeout). Long-running commands are automatically promoted to background jobs — use dgx_job_log to check output.",
             inputSchema: [
                 "type": "object",
                 "properties": [
                     "command": ["type": "string", "description": "Command to run (e.g., 'pip list', 'nvidia-smi', 'ls -la')"],
-                    "container": ["type": "string", "description": "Container name (default: twinprime)"]
+                    "container": ["type": "string", "description": "Container name (default: twinprime)"],
+                    "timeout": ["type": "integer", "description": "Max seconds to wait for output (default: 30). If exceeded, command continues as background job."]
                 ] as [String: Any],
                 "required": ["command"] as [String]
             ]
@@ -494,7 +495,7 @@ enum DGX {
             return try await serviceRestart(service: svc)
         case "dgx_exec":
             guard let cmd = args["command"] as? String else { throw MCPError.unknownTool("dgx_exec requires command") }
-            return try await exec(command: cmd, container: args["container"] as? String)
+            return try await exec(command: cmd, container: args["container"] as? String, timeout: args["timeout"] as? Int)
         case "dgx_sync":
             guard let dir = args["direction"] as? String else { throw MCPError.unknownTool("dgx_sync requires direction") }
             return try await sync(direction: dir, project: args["project"] as? String)
@@ -945,29 +946,47 @@ enum DGX {
 
     // MARK: - Shell Helpers
 
-    private static func shell(_ command: String) async throws -> (out: String, code: Int32) {
+    private static func shell(_ command: String, timeout: TimeInterval = 300) async throws -> (out: String, code: Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["-c", command]
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
         try process.run()
-        process.waitUntilExit()
 
-        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global().async {
+                    let timer = DispatchSource.makeTimerSource(queue: .global())
+                    timer.schedule(deadline: .now() + timeout)
+                    timer.setEventHandler { process.terminate() }
+                    timer.resume()
 
-        var output = String(data: outData, encoding: .utf8) ?? ""
-        if let err = String(data: errData, encoding: .utf8), !err.isEmpty {
-            if !output.isEmpty { output += "\n" }
-            output += err
+                    process.waitUntilExit()
+                    timer.cancel()
+
+                    let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+                    var output = String(data: outData, encoding: .utf8) ?? ""
+                    if let err = String(data: errData, encoding: .utf8), !err.isEmpty {
+                        if !output.isEmpty { output += "\n" }
+                        output += err
+                    }
+
+                    continuation.resume(returning: (
+                        output.trimmingCharacters(in: .whitespacesAndNewlines),
+                        process.terminationStatus
+                    ))
+                }
+            }
+        } onCancel: {
+            process.terminate()
         }
-
-        return (output.trimmingCharacters(in: .whitespacesAndNewlines), process.terminationStatus)
     }
 
     // MARK: - SSH Connection Pooling
@@ -983,6 +1002,8 @@ enum DGX {
         "-o", "ControlMaster=auto",
         "-o", "ControlPersist=300",  // Keep socket open 5 minutes after last use
         "-o", "ConnectTimeout=5",
+        "-o", "ServerAliveInterval=15",  // Ping every 15s to detect dead connections
+        "-o", "ServerAliveCountMax=2",   // 2 missed pings = dead (~30s detection)
         "-o", "BatchMode=yes"
     ]
 
@@ -1638,7 +1659,7 @@ enum DGX {
         return lines.joined(separator: "\n")
     }
 
-    private static func exec(command: String, container: String?) async throws -> String {
+    private static func exec(command: String, container: String?, timeout: Int? = nil) async throws -> String {
         let config = try loadConfig()
         let containerName = container ?? "twinprime"
 
@@ -1654,14 +1675,53 @@ enum DGX {
             workdir = c.workdir
         }
 
-        // Escape for: ssh host 'docker exec -w dir container bash -c "command"'
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "$", with: "\\$")
+        let timeoutSec = timeout ?? 30
+        let execId = "exec_\(Int(Date().timeIntervalSince1970))"
 
-        let (result, _) = try await ssh("docker exec -w \(workdir) \(containerName) bash -c \"\(escaped)\"")
-        return result
+        // Ensure jobs dir exists
+        let _ = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
+
+        // Run detached — same pattern as jobStart(): interpolate command directly into script,
+        // escape only the outer docker exec bash -c "..." wrapper
+        let script = """
+            cd \(workdir) && \
+            (\(command)) > \(jobsDir)/\(execId).log 2>&1; \
+            echo $? > \(jobsDir)/\(execId).exit
+            """
+        let dockerCmd = "docker exec -d \(containerName) bash -c \"\(script.replacingOccurrences(of: "\"", with: "\\\""))\""
+        let (_, ok) = try await ssh(dockerCmd)
+
+        guard ok == 0 else {
+            return "Failed to start command"
+        }
+
+        // Async poll — each iteration yields the cooperative thread
+        for i in 0..<timeoutSec {
+            // Poll faster for the first few seconds (most commands are quick)
+            let sleepNs: UInt64 = i < 5 ? 500_000_000 : 1_000_000_000
+            try await Task.sleep(nanoseconds: sleepNs)
+
+            let (_, done) = try await ssh("docker exec \(containerName) test -f \(jobsDir)/\(execId).exit")
+            if done == 0 {
+                // Completed — return output inline, clean up temp files
+                let (output, _) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(execId).log")
+                let _ = try await ssh("docker exec \(containerName) rm -f \(jobsDir)/\(execId).log \(jobsDir)/\(execId).exit 2>/dev/null")
+                return output
+            }
+        }
+
+        // Timeout — promote to a trackable background job so dgx_jobs/dgx_job_log can find it.
+        // Use separate quick SSH calls to avoid nested escaping issues.
+        let _ = try await ssh("docker exec \(containerName) bash -c 'echo running > \(jobsDir)/\(execId).status'")
+        let _ = try await ssh("docker exec \(containerName) bash -c 'date +%s > \(jobsDir)/\(execId).start'")
+        // Base64-encode command to avoid all escaping issues
+        let cmdBase64 = Data(command.utf8).base64EncodedString()
+        let _ = try await ssh("docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(execId).cmd'")
+
+        return "Command still running after \(timeoutSec)s — promoted to background.\n" +
+               "Job: \(execId)\n" +
+               "  dgx_job_log(\"\(execId)\") — check output\n" +
+               "  dgx_job_kill(\"\(execId)\") — stop it"
     }
 
     private static func sync(direction: String, project projectName: String?) async throws -> String {
@@ -2028,12 +2088,15 @@ enum DGX {
         // Ensure jobs directory exists
         let _ = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
 
+        // Write .cmd file via base64 to avoid all escaping issues with quotes/special chars
+        let cmdBase64 = Data(command.utf8).base64EncodedString()
+        let _ = try await ssh("docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(jobId).cmd'")
+
         // Create the job script that handles logging and status
         // PYTHONUNBUFFERED=1 ensures real-time log output for Python scripts
         // .start file records start timestamp for elapsed time calculation
         let script = """
             cd \(dir) && \\
-            echo '\(command)' > \(jobsDir)/\(jobId).cmd && \\
             echo 'running' > \(jobsDir)/\(jobId).status && \\
             date +%s > \(jobsDir)/\(jobId).start && \\
             echo $$ > \(jobsDir)/\(jobId).pid && \\
@@ -2043,7 +2106,7 @@ enum DGX {
             echo 'completed' > \(jobsDir)/\(jobId).status
             """
 
-        // Run detached with nohup
+        // Run detached
         let dockerCmd = "docker exec -d \(containerName) bash -c \"\(script.replacingOccurrences(of: "\"", with: "\\\""))\""
         let (_, ok) = try await ssh(dockerCmd)
 
