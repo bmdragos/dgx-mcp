@@ -1690,58 +1690,50 @@ enum DGX {
         let timeoutSec = timeout ?? 30
         let execId = "exec_\(Int(Date().timeIntervalSince1970))"
 
-        // Check container is running before attempting exec
-        let (containerStatus, statusOk) = try await ssh("docker inspect \(containerName) --format '{{.State.Status}}'")
-        let status = containerStatus.trimmingCharacters(in: .whitespacesAndNewlines)
-        if statusOk != 0 {
+        // Single SSH call: check container + mkdir + launch detached
+        let setupScript = """
+            status=$(docker inspect \(containerName) --format '{{.State.Status}}' 2>&1) || { echo "NOT_FOUND"; exit 0; }
+            case "$status" in
+                running) ;;
+                *) echo "NOT_RUNNING:$status"; exit 0 ;;
+            esac
+            docker exec \(containerName) mkdir -p \(jobsDir) || { echo "MKDIR_FAIL"; exit 0; }
+            docker exec -d \(containerName) bash -c "cd \(workdir) && (\(command.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "$", with: "\\$"))) > \(jobsDir)/\(execId).log 2>&1; echo \\$? > \(jobsDir)/\(execId).exit"
+            echo "OK"
+            """
+        let (setupOut, setupOk) = try await ssh(setupScript)
+        let setupResult = setupOut.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if setupResult == "NOT_FOUND" {
             return "Container '\(containerName)' not found. Use dgx_containers to see available containers."
         }
-        if status != "running" {
-            return "Container '\(containerName)' is \(status). Start it first:\n  dgx_exec(command: \"docker start \(containerName)\") or use dgx_status to check."
+        if setupResult.hasPrefix("NOT_RUNNING:") {
+            let s = setupResult.replacingOccurrences(of: "NOT_RUNNING:", with: "")
+            return "Container '\(containerName)' is \(s). Start it first:\n  dgx_exec(command: \"docker start \(containerName)\") or use dgx_status to check."
+        }
+        if setupResult == "MKDIR_FAIL" {
+            return "Failed to create jobs directory in \(containerName)"
+        }
+        guard setupOk == 0 && setupResult == "OK" else {
+            return "Failed to start command in \(containerName): \(setupOut)"
         }
 
-        // Ensure jobs dir exists
-        let (mkdirOut, mkdirOk) = try await ssh("docker exec \(containerName) mkdir -p \(jobsDir)")
-        if mkdirOk != 0 {
-            return "Failed to create jobs directory in \(containerName): \(mkdirOut)"
-        }
-
-        // Run detached — same pattern as jobStart(): interpolate command directly into script,
-        // escape only the outer docker exec bash -c "..." wrapper
-        let script = """
-            cd \(workdir) && \
-            (\(command)) > \(jobsDir)/\(execId).log 2>&1; \
-            echo $? > \(jobsDir)/\(execId).exit
-            """
-        let dockerCmd = "docker exec -d \(containerName) bash -c \"\(script.replacingOccurrences(of: "\"", with: "\\\""))\""
-        let (execOut, ok) = try await ssh(dockerCmd)
-
-        guard ok == 0 else {
-            return "Failed to start command in \(containerName): \(execOut)"
-        }
-
-        // Async poll — each iteration yields the cooperative thread
+        // Async poll — single SSH per iteration: test + cat + rm in one call
         for i in 0..<timeoutSec {
-            // Poll faster for the first few seconds (most commands are quick)
             let sleepNs: UInt64 = i < 5 ? 500_000_000 : 1_000_000_000
             try await Task.sleep(nanoseconds: sleepNs)
 
-            let (_, done) = try await ssh("docker exec \(containerName) test -f \(jobsDir)/\(execId).exit")
-            if done == 0 {
-                // Completed — return output inline, clean up temp files
-                let (output, _) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(execId).log")
-                let _ = try await ssh("docker exec \(containerName) rm -f \(jobsDir)/\(execId).log \(jobsDir)/\(execId).exit 2>/dev/null")
-                return truncateOutput(output)
+            let pollScript = "docker exec \(containerName) bash -c 'test -f \(jobsDir)/\(execId).exit && cat \(jobsDir)/\(execId).log && rm -f \(jobsDir)/\(execId).log \(jobsDir)/\(execId).exit'"
+            let (pollOut, pollOk) = try await ssh(pollScript)
+            if pollOk == 0 {
+                return truncateOutput(pollOut)
             }
         }
 
-        // Timeout — promote to a trackable background job so dgx_jobs/dgx_job_log can find it.
-        // Use separate quick SSH calls to avoid nested escaping issues.
-        let _ = try await ssh("docker exec \(containerName) bash -c 'echo running > \(jobsDir)/\(execId).status'")
-        let _ = try await ssh("docker exec \(containerName) bash -c 'date +%s > \(jobsDir)/\(execId).start'")
-        // Base64-encode command to avoid all escaping issues
+        // Timeout — promote to background job (single SSH call)
         let cmdBase64 = Data(command.utf8).base64EncodedString()
-        let _ = try await ssh("docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(execId).cmd'")
+        let promoteScript = "docker exec \(containerName) bash -c 'echo running > \(jobsDir)/\(execId).status && date +%s > \(jobsDir)/\(execId).start && echo \(cmdBase64) | base64 -d > \(jobsDir)/\(execId).cmd'"
+        let _ = try await ssh(promoteScript)
 
         return "Command still running after \(timeoutSec)s — promoted to background.\n" +
                "Job: \(execId)\n" +
