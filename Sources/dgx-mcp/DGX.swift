@@ -2451,31 +2451,33 @@ enum DGX {
         let n = lines ?? 50
 
         let logFile = "\(jobsDir)/\(jobId).log"
+        let tailCmd = n == 0 ? "cat" : "tail -n \(n)"
 
-        // Check if job exists
-        let (_, exists) = try await ssh("docker exec \(containerName) test -f \(logFile)")
-        if exists != 0 {
+        // Single SSH call: check existence + status + log content
+        let script = "docker exec \(containerName) bash -c 'test -f \(logFile) || { echo NOT_FOUND; exit 0; }; exit_code=$(cat \(jobsDir)/\(jobId).exit 2>/dev/null || echo RUNNING); echo \"STATUS:$exit_code\"; echo \"---LOG---\"; \(tailCmd) \(logFile)'"
+        let (rawOut, _) = try await ssh(script)
+
+        if rawOut.contains("NOT_FOUND") {
             return "Job not found: \(jobId)"
         }
 
-        // Reliable status detection using .exit file
-        let (_, exitExists) = try await ssh("docker exec \(containerName) test -f \(jobsDir)/\(jobId).exit")
+        // Parse status
         let status: String
-        if exitExists == 0 {
-            // Job has completed - get exit code
-            let (exitCode, _) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).exit")
-            let code = exitCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        let logSplit = rawOut.components(separatedBy: "---LOG---")
+        let statusLine = logSplit.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if statusLine.hasPrefix("STATUS:RUNNING") {
+            status = "running"
+        } else if let code = statusLine.replacingOccurrences(of: "STATUS:", with: "").trimmingCharacters(in: .whitespacesAndNewlines) as String? {
             status = code == "0" ? "completed (exit 0)" : "failed (exit \(code))"
         } else {
-            status = "running"
+            status = "unknown"
         }
 
         var out = "=== Job: \(jobId) ===\n"
         out += "Status: \(status)\n\n"
 
-        // Get log content
-        let tailCmd = n == 0 ? "cat" : "tail -n \(n)"
-        let (log, _) = try await ssh("docker exec \(containerName) \(tailCmd) \(logFile)")
+        // Parse log content
+        let log = logSplit.count > 1 ? logSplit[1] : ""
 
         // Detect errors in log output
         let errors = detectErrors(in: log)
@@ -2597,37 +2599,84 @@ enum DGX {
         let containerName = container ?? "twinprime"
         let logFile = "\(jobsDir)/\(jobId).log"
 
-        // Check if job exists
-        let (_, exists) = try await ssh("docker exec \(containerName) test -f \(logFile)")
-        if exists != 0 {
-            return "Job not found: \(jobId)"
-        }
-
         // Load state to get last read position
         var state = loadState()
         let lastPos = state.jobWatchState[jobId]?.lastBytePosition ?? 0
 
-        // Get current file size
-        let (sizeStr, _) = try await ssh("docker exec \(containerName) stat -c%s \(logFile) 2>/dev/null || echo 0")
-        let currentSize = Int(sizeStr.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        // Single SSH call: gather all job metadata + GPU info + log content
+        let watchScript = """
+            test -f \(logFile) || { echo "NOT_FOUND"; exit 0; }
+            size=$(stat -c%s \(logFile) 2>/dev/null || echo 0)
+            has_exit=$(test -f \(jobsDir)/\(jobId).exit && echo 1 || echo 0)
+            start=$(cat \(jobsDir)/\(jobId).start 2>/dev/null || echo 0)
+            endtime=$(cat \(jobsDir)/\(jobId).end 2>/dev/null || echo 0)
+            now=$(date +%s)
+            echo "$size|$has_exit|$start|$endtime|$now"
+            echo "---GPU---"
+            nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || echo "0, 0, 128000, 0"
+            echo "---LOG---"
+            if [ \(lastPos) -eq 0 ]; then
+                docker exec \(containerName) tail -n 20 \(logFile) 2>/dev/null
+            elif [ "$size" -gt \(lastPos) ]; then
+                docker exec \(containerName) tail -c $(($size - \(lastPos))) \(logFile) 2>/dev/null
+            else
+                echo "NO_NEW_OUTPUT"
+            fi
+            """
+        // Run on DGX host (nvidia-smi runs on host, docker exec for container log)
+        // But log file is inside container, so we need to restructure...
+        // Actually: nvidia-smi runs on host, log is in container. Split into 2 calls max.
+        let metaScript = """
+            echo "---META---"
+            docker exec \(containerName) bash -c '
+                test -f \(logFile) || { echo "NOT_FOUND"; exit 0; }
+                size=$(stat -c%s \(logFile) 2>/dev/null || echo 0)
+                has_exit=$(test -f \(jobsDir)/\(jobId).exit && echo 1 || echo 0)
+                start=$(cat \(jobsDir)/\(jobId).start 2>/dev/null || echo 0)
+                endtime=$(cat \(jobsDir)/\(jobId).end 2>/dev/null || echo 0)
+                now=$(date +%s)
+                echo "$size|$has_exit|$start|$endtime|$now"
+                echo "---LOG---"
+                if [ \(lastPos) -eq 0 ]; then
+                    tail -n 20 \(logFile)
+                elif [ "$size" -gt \(lastPos) ]; then
+                    tail -c $(($size - \(lastPos))) \(logFile)
+                else
+                    echo "NO_NEW_OUTPUT"
+                fi
+            '
+            echo "---GPU---"
+            nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || echo "0, 0, 128000, 0"
+            """
+        let (rawOut, _) = try await ssh(metaScript)
 
-        // Get job status and time
-        let (_, exitExists) = try await ssh("docker exec \(containerName) test -f \(jobsDir)/\(jobId).exit")
-        let isRunning = exitExists != 0
+        if rawOut.contains("NOT_FOUND") {
+            return "Job not found: \(jobId)"
+        }
 
+        // Parse sections
+        let metaSplit = rawOut.components(separatedBy: "---META---")
+        let afterMeta = metaSplit.count > 1 ? metaSplit[1] : rawOut
+        let logSplit = afterMeta.components(separatedBy: "---LOG---")
+        let gpuSplit = afterMeta.components(separatedBy: "---GPU---")
+
+        // Parse metadata: size|has_exit|start|endtime|now
+        let metaLine = logSplit.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let metaParts = metaLine.split(separator: "|").map { String($0) }
+        let currentSize = metaParts.count > 0 ? (Int(metaParts[0]) ?? 0) : 0
+        let hasExit = metaParts.count > 1 ? metaParts[1] == "1" : false
+        let startTime = metaParts.count > 2 ? (Int(metaParts[2]) ?? 0) : 0
+        let endTime = metaParts.count > 3 ? (Int(metaParts[3]) ?? 0) : 0
+        let nowTime = metaParts.count > 4 ? (Int(metaParts[4]) ?? 0) : 0
+        let isRunning = !hasExit
+
+        // Build time string
         var timeStr = ""
-        let (startStr, startOk) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).start 2>/dev/null")
-        if startOk == 0, let start = Int(startStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            if isRunning {
-                let (nowStr, _) = try await ssh("docker exec \(containerName) date +%s")
-                if let now = Int(nowStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    timeStr = "Elapsed: \(formatDuration(now - start))"
-                }
-            } else {
-                let (endStr, endOk) = try await ssh("docker exec \(containerName) cat \(jobsDir)/\(jobId).end 2>/dev/null")
-                if endOk == 0, let end = Int(endStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    timeStr = "Duration: \(formatDuration(end - start))"
-                }
+        if startTime > 0 {
+            if isRunning && nowTime > 0 {
+                timeStr = "Elapsed: \(formatDuration(nowTime - startTime))"
+            } else if !isRunning && endTime > 0 {
+                timeStr = "Duration: \(formatDuration(endTime - startTime))"
             }
         }
 
@@ -2636,24 +2685,15 @@ enum DGX {
         if !timeStr.isEmpty { out += " | \(timeStr)" }
         out += "\n"
 
-        // Show GPU stats if running
+        // Parse GPU info
         if isRunning {
-            let (gpuInfo, gpuOk) = try await ssh("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits")
-            if gpuOk == 0 {
-                let parts = gpuInfo.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                if parts.count >= 4 {
-                    out += "GPU: \(parts[0])% util | \(parts[1])/\(parts[2]) MiB | \(parts[3])°C\n"
-                }
+            let gpuLine = gpuSplit.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let gpuParts = gpuLine.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            if gpuParts.count >= 4 {
+                out += "GPU: \(gpuParts[0])% util | \(gpuParts[1])/\(gpuParts[2]) MiB | \(gpuParts[3])°C\n"
             }
         } else {
-            // Show metrics for completed jobs
-            let (fullLog, _) = try await ssh("docker exec \(containerName) cat \(logFile)")
-            let metrics = extractMetrics(from: fullLog)
-            if !metrics.isEmpty {
-                out += formatMetrics(metrics)
-            }
-
-            // Suggest result sync
+            // Suggest result sync for completed jobs
             let syncState = loadState()
             let projectHint = syncState.lastProject ?? "<name>"
             out += "💡 TIP: Sync results with: dgx_sync(direction: \"pull\", project: \"\(projectHint)\")\n"
@@ -2661,37 +2701,45 @@ enum DGX {
 
         out += "\n"
 
-        // Get new output since last check
-        if currentSize > lastPos {
-            let bytesToRead = currentSize - lastPos
-            let (newContent, _) = try await ssh("docker exec \(containerName) tail -c \(bytesToRead) \(logFile)")
-            if newContent.isEmpty {
-                out += "(no new output)\n"
+        // Parse log content (between ---LOG--- and ---GPU---)
+        var logContent = ""
+        if logSplit.count > 1 {
+            // Everything between ---LOG--- and ---GPU---
+            let afterLog = logSplit[1]
+            if let gpuIdx = afterLog.range(of: "---GPU---") {
+                logContent = String(afterLog[afterLog.startIndex..<gpuIdx.lowerBound])
             } else {
-                // Check for errors in new content
-                let errors = detectErrors(in: newContent)
-                if !errors.isEmpty {
-                    out += formatErrors(errors)
-                }
-                out += "--- New output (\(bytesToRead) bytes) ---\n"
-                out += newContent
-                if !newContent.hasSuffix("\n") { out += "\n" }
-                out += "--- End new output ---\n"
+                logContent = afterLog
             }
-        } else if lastPos == 0 {
-            // First watch - show last 20 lines
-            let (recent, _) = try await ssh("docker exec \(containerName) tail -n 20 \(logFile)")
-            // Check for errors in recent content
-            let errors = detectErrors(in: recent)
+            logContent = logContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if logContent == "NO_NEW_OUTPUT" || logContent.isEmpty {
+            out += "(no new output since last check)\n"
+        } else {
+            // Check for errors
+            let errors = detectErrors(in: logContent)
             if !errors.isEmpty {
                 out += formatErrors(errors)
             }
-            out += "--- Recent output (last 20 lines) ---\n"
-            out += recent
-            if !recent.hasSuffix("\n") { out += "\n" }
-            out += "--- End recent output ---\n"
-        } else {
-            out += "(no new output since last check)\n"
+
+            // Check for metrics in completed jobs
+            if !isRunning {
+                let metrics = extractMetrics(from: logContent)
+                if !metrics.isEmpty {
+                    out += formatMetrics(metrics)
+                }
+            }
+
+            if lastPos == 0 {
+                out += "--- Recent output (last 20 lines) ---\n"
+            } else {
+                let bytesRead = currentSize - lastPos
+                out += "--- New output (\(bytesRead) bytes) ---\n"
+            }
+            out += logContent
+            if !logContent.hasSuffix("\n") { out += "\n" }
+            out += "--- End output ---\n"
         }
 
         // Update state with new position
