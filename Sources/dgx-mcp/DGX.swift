@@ -2122,13 +2122,14 @@ enum DGX {
         let cmdBase64 = Data(command.utf8).base64EncodedString()
         let _ = try await ssh("docker exec \(containerName) bash -c 'echo \(cmdBase64) | base64 -d > \(jobsDir)/\(jobId).cmd'")
 
+        // Write .status and .start BEFORE detached launch so dgx_jobs sees the job immediately
+        let _ = try await ssh("docker exec \(containerName) bash -c 'echo running > \(jobsDir)/\(jobId).status && date +%s > \(jobsDir)/\(jobId).start'")
+
         // Create the job script that handles logging and status
         // PYTHONUNBUFFERED=1 ensures real-time log output for Python scripts
-        // .start file records start timestamp for elapsed time calculation
+        // .status and .start already written above (before detach) to avoid race with dgx_jobs
         let script = """
             cd \(dir) && \\
-            echo 'running' > \(jobsDir)/\(jobId).status && \\
-            date +%s > \(jobsDir)/\(jobId).start && \\
             echo $$ > \(jobsDir)/\(jobId).pid && \\
             (PYTHONUNBUFFERED=1 \(command)) > \(jobsDir)/\(jobId).log 2>&1; \\
             echo $? > \(jobsDir)/\(jobId).exit; \\
